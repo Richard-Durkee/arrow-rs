@@ -4,7 +4,7 @@
 
 use std::hint::black_box;
 
-use arrow_array::{Array, Date64Array, TimestampNanosecondArray};
+use arrow_array::{Array, Date32Array, Date64Array, TimestampNanosecondArray};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
@@ -13,6 +13,8 @@ const SHORT_FORMAT: &str = "%Y-%m-%d";
 const LONG_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.9f";
 
 fn format_array(c: &mut Criterion) {
+    // Days from 1992-01-01 onwards, so the month and day vary between rows.
+    let date32 = Date32Array::from_iter_values((0..ARRAY_LEN as i32).map(|i| 8035 + i));
     let date64 = Date64Array::from_value(1_754_668_645_123, ARRAY_LEN);
     let timestamp = TimestampNanosecondArray::from_value(1_754_668_645_123_456_789, ARRAY_LEN);
     let timestamp_tz = timestamp.clone().with_timezone("+08:00");
@@ -20,6 +22,11 @@ fn format_array(c: &mut Criterion) {
     let mut group = c.benchmark_group("format_temporal");
 
     for (id, array, options) in [
+        (
+            BenchmarkId::new("date32", "default"),
+            &date32 as &dyn Array,
+            FormatOptions::new(),
+        ),
         (
             BenchmarkId::new("date64", "default"),
             &date64 as &dyn Array,

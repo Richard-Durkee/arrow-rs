@@ -23,7 +23,7 @@ use arrow_buffer::ArrowNativeType;
 use arrow_data::decimal::write_decimal;
 use arrow_schema::*;
 use chrono::format::{Item, StrftimeItems};
-use chrono::{NaiveDate, NaiveDateTime, Offset, SecondsFormat, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Offset, SecondsFormat, TimeZone, Utc};
 use lexical_core::FormattedSize;
 
 type TimeFormat<'a> = Option<&'a str>;
@@ -832,12 +832,58 @@ macro_rules! temporal_display {
                     CompiledTimeFormat::Custom(items) => {
                         write!(f, "{}", naive.format_with_items(items.0.iter()))?
                     }
-                    CompiledTimeFormat::Default => write!(f, "{naive:?}")?,
+                    CompiledTimeFormat::Default => naive.write_default(f)?,
                 }
                 Ok(())
             }
         }
     };
+}
+
+/// Writes a temporal value in its default format, which is chrono's `Debug`
+/// output.
+trait WriteDefault {
+    fn write_default(&self, f: &mut dyn Write) -> std::fmt::Result;
+}
+
+impl WriteDefault for NaiveDate {
+    /// Writes `YYYY-MM-DD` in one call. chrono's `Debug` writes the same text
+    /// one character at a time, which is slow through a `dyn Write`.
+    fn write_default(&self, f: &mut dyn Write) -> std::fmt::Result {
+        let year = self.year();
+        if !(0..=9999).contains(&year) {
+            // chrono uses a sign and at least five digits here
+            return write!(f, "{self:?}");
+        }
+        let (year, month, day) = (year as u32, self.month(), self.day());
+        let digit = |v: u32| b'0' + v as u8;
+        let buf = [
+            digit(year / 1000),
+            digit(year / 100 % 10),
+            digit(year / 10 % 10),
+            digit(year % 10),
+            b'-',
+            digit(month / 10),
+            digit(month % 10),
+            b'-',
+            digit(day / 10),
+            digit(day % 10),
+        ];
+        // All bytes are ASCII digits or '-'
+        f.write_str(std::str::from_utf8(&buf).unwrap())
+    }
+}
+
+impl WriteDefault for NaiveDateTime {
+    fn write_default(&self, f: &mut dyn Write) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl WriteDefault for NaiveTime {
+    fn write_default(&self, f: &mut dyn Write) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 
 #[inline]
@@ -1682,5 +1728,32 @@ mod tests {
         assert_eq!("", array_value_to_string(&list_view, 1).unwrap());
         assert_eq!("[4, , 6]", array_value_to_string(&list_view, 2).unwrap());
         assert_eq!("[]", array_value_to_string(&list_view, 3).unwrap());
+    }
+
+    #[test]
+    fn test_date32_default_format_matches_chrono() {
+        // Covers negative years, years 0 to 9999 and years with five digits,
+        // where the default format falls back to chrono.
+        let days: Vec<i32> = (-800_000..3_000_000)
+            .step_by(997)
+            .chain([
+                i32::MIN,
+                i32::MAX,
+                -719_528,
+                -719_529,
+                0,
+                2_932_896,
+                2_932_897,
+            ])
+            .collect();
+        let array = Date32Array::from(days.clone());
+        let formatter = ArrayFormatter::try_new(&array, &FormatOptions::new()).unwrap();
+        for (i, day) in days.into_iter().enumerate() {
+            let expected = match date32_to_date(day) {
+                Some(date) => format!("{date:?}"),
+                None => continue,
+            };
+            assert_eq!(formatter.value(i).to_string(), expected, "day {day}");
+        }
     }
 }
