@@ -424,7 +424,7 @@ fn eq_inline_scalar(
     }
     let significant = u64::MAX >> (32 - needle_len * 8);
     let needle = needle as u64 & significant;
-    Some(collect_bool(values.len(), negate, |idx| {
+    Some(collect_bool(values.len(), negate, false, |idx| {
         let view = unsafe { *values.get_unchecked(idx) };
         view as u64 & significant == needle
     }))
@@ -572,24 +572,46 @@ fn take_bits(v: &dyn AnyDictionaryArray, buffer: BooleanBuffer) -> BooleanBuffer
 /// Invokes `f` with values `0..len` collecting the boolean results into a new `BooleanBuffer`
 ///
 /// This is similar to [`arrow_buffer::MutableBuffer::collect_bool`] but with
-/// the option to efficiently negate the result
-fn collect_bool(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
+/// the option to efficiently negate the result.
+///
+/// With `via_bytes`, each chunk of 64 results is written to bytes first and
+/// packed into bits afterwards. This lets LLVM vectorize `f` for values of up
+/// to 8 bytes, which it does not do when each result is shifted into the
+/// packed word directly. For wider values, such as `i128` or views, it is
+/// slower, so callers pass `false` there.
+fn collect_bool(
+    len: usize,
+    neg: bool,
+    via_bytes: bool,
+    f: impl Fn(usize) -> bool,
+) -> BooleanBuffer {
     let mut buffer = Vec::with_capacity(ceil(len, 64));
 
     let chunks = len / 64;
     let remainder = len % 64;
-    buffer.extend((0..chunks).map(|chunk| {
-        let mut packed = 0;
-        for bit_idx in 0..64 {
-            let i = bit_idx + chunk * 64;
-            packed |= (f(i) as u64) << bit_idx;
-        }
-        if neg {
-            packed = !packed
-        }
-
-        packed
-    }));
+    if via_bytes {
+        buffer.extend((0..chunks).map(|chunk| {
+            let mut bytes = [0u8; 64];
+            for (bit_idx, byte) in bytes.iter_mut().enumerate() {
+                *byte = f(bit_idx + chunk * 64) as u8;
+            }
+            let mut packed = 0;
+            for (word_idx, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
+                let word = u64::from_le_bytes(*word);
+                packed |= pack_bytes(word) << (word_idx * 8);
+            }
+            if neg { !packed } else { packed }
+        }));
+    } else {
+        buffer.extend((0..chunks).map(|chunk| {
+            let mut packed = 0;
+            for bit_idx in 0..64 {
+                let i = bit_idx + chunk * 64;
+                packed |= (f(i) as u64) << bit_idx;
+            }
+            if neg { !packed } else { packed }
+        }));
+    }
 
     if remainder != 0 {
         let mut packed = 0;
@@ -604,6 +626,20 @@ fn collect_bool(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuff
         buffer.push(packed);
     }
     BooleanBuffer::new(buffer.into(), 0, len)
+}
+
+/// Whether [`collect_bool`] should pack via bytes for values of type `T`
+const fn via_bytes<T>() -> bool {
+    std::mem::size_of::<T>() <= 8
+}
+
+/// Packs 8 bytes, each 0 or 1, into the low 8 bits: byte `k` becomes bit `k`
+///
+/// The multiplication moves byte `k` to bit `56 + k`, and the bytes cannot
+/// carry into each other because each is 0 or 1.
+#[inline(always)]
+fn pack_bytes(word: u64) -> u64 {
+    word.wrapping_mul(0x0102_0408_1020_4080) >> 56
 }
 
 /// Applies `op` to possibly scalar `ArrayOrd`
@@ -623,7 +659,7 @@ fn apply_op<T: ArrayOrd>(
     match (l_s, r_s) {
         (None, None) => {
             assert_eq!(l.len(), r.len());
-            collect_bool(l.len(), neg, |idx| unsafe {
+            collect_bool(l.len(), neg, via_bytes::<T::Item>(), |idx| unsafe {
                 op(l.value_unchecked(idx), r.value_unchecked(idx))
             })
         }
@@ -634,11 +670,15 @@ fn apply_op<T: ArrayOrd>(
         }
         (Some(l_s), None) => {
             let v = l.value(l_s);
-            collect_bool(r.len(), neg, |idx| op(v, unsafe { r.value_unchecked(idx) }))
+            collect_bool(r.len(), neg, via_bytes::<T::Item>(), |idx| {
+                op(v, unsafe { r.value_unchecked(idx) })
+            })
         }
         (None, Some(r_s)) => {
             let v = r.value(r_s);
-            collect_bool(l.len(), neg, |idx| op(unsafe { l.value_unchecked(idx) }, v))
+            collect_bool(l.len(), neg, via_bytes::<T::Item>(), |idx| {
+                op(unsafe { l.value_unchecked(idx) }, v)
+            })
         }
     }
 }
@@ -653,7 +693,7 @@ fn apply_op_vectored<T: ArrayOrd>(
     op: impl Fn(T::Item, T::Item) -> bool,
 ) -> BooleanBuffer {
     assert_eq!(l_v.len(), r_v.len());
-    collect_bool(l_v.len(), neg, |idx| unsafe {
+    collect_bool(l_v.len(), neg, false, |idx| unsafe {
         let l_idx = *l_v.get_unchecked(idx);
         let r_idx = *r_v.get_unchecked(idx);
         op(l.value_unchecked(l_idx), r.value_unchecked(r_idx))
@@ -984,7 +1024,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::types::Int32Type;
-    use arrow_array::{DictionaryArray, Int32Array, Scalar, StringArray};
+    use arrow_array::{
+        DictionaryArray, Float64Array, Int8Array, Int32Array, Int64Array, Scalar, StringArray,
+    };
     use arrow_buffer::{Buffer, ScalarBuffer};
 
     use super::*;
@@ -1611,5 +1653,55 @@ mod tests {
         assert_eq!(compare_byte_view(&a, 1, &b, 1), Ordering::Greater);
         assert_eq!(compare_byte_view(&a, 2, &b, 2), Ordering::Equal);
         assert_eq!(compare_byte_view(&a, 3, &b, 3), Ordering::Greater);
+    }
+
+    /// Checks the byte packing in `collect_bool` against a per-row reference,
+    /// for lengths around the 64-row chunks and for every operator, including
+    /// the negated ones.
+    #[test]
+    fn test_primitive_scalar_cmp_all_lengths() {
+        macro_rules! check {
+            ($array:ty, $values:expr, $scalar:expr) => {{
+                let values = $values;
+                let scalar = $scalar;
+                for len in [0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 200] {
+                    let array = <$array>::from(values[..len].to_vec());
+                    let datum = <$array>::new_scalar(scalar);
+                    let cases: [(BooleanArray, fn(_, _) -> bool); 6] = [
+                        (eq(&array, &datum).unwrap(), |a, b| a == b),
+                        (neq(&array, &datum).unwrap(), |a, b| a != b),
+                        (lt(&array, &datum).unwrap(), |a, b| a < b),
+                        (lt_eq(&array, &datum).unwrap(), |a, b| a <= b),
+                        (gt(&array, &datum).unwrap(), |a, b| a > b),
+                        (gt_eq(&array, &datum).unwrap(), |a, b| a >= b),
+                    ];
+                    for (op_idx, (result, reference)) in cases.into_iter().enumerate() {
+                        let expected: Vec<bool> = values[..len]
+                            .iter()
+                            .map(|v| reference(*v, scalar))
+                            .collect();
+                        let actual: Vec<bool> = result.values().iter().collect();
+                        assert_eq!(actual, expected, "op {op_idx} len {len}");
+                    }
+                }
+            }};
+        }
+        let ints: Vec<i64> = (0..200).map(|i| (i * 7919) % 13 - 6).collect();
+        check!(
+            Int8Array,
+            ints.iter().map(|&v| v as i8).collect::<Vec<_>>(),
+            0i8
+        );
+        check!(
+            Int32Array,
+            ints.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            2i32
+        );
+        check!(Int64Array, ints.clone(), -3i64);
+        check!(
+            Float64Array,
+            ints.iter().map(|&v| v as f64 / 2.0).collect::<Vec<_>>(),
+            0.5f64
+        );
     }
 }
