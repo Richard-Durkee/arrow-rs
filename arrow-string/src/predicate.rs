@@ -5,8 +5,8 @@
 use arrow_array::{Array, ArrayAccessor, BooleanArray, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::ArrowError;
-use memchr::memchr3;
 use memchr::memmem::Finder;
+use memchr::{memchr2, memchr3};
 use regex::{Regex, RegexBuilder};
 use std::iter::zip;
 
@@ -25,6 +25,9 @@ pub(crate) enum Predicate<'a> {
     /// Ends with ignoring ASCII case
     IEndsWithAscii(&'a str),
 
+    /// Literal segments separated by `%`, e.g. `foo%bar%baz`, see [`Segments`]
+    Segments(Segments<'a>),
+
     Regex(Regex),
 }
 
@@ -42,6 +45,8 @@ impl<'a> Predicate<'a> {
             && !contains_like_pattern(&pattern[1..pattern.len() - 1])
         {
             Ok(Self::contains(&pattern[1..pattern.len() - 1]))
+        } else if let Some(segments) = Segments::new(pattern) {
+            Ok(Self::Segments(segments))
         } else {
             Ok(Self::Regex(regex_like(pattern, false)?))
         }
@@ -80,6 +85,7 @@ impl<'a> Predicate<'a> {
             }
             Predicate::EndsWith(v) => ends_with(haystack, v, equals_kernel),
             Predicate::IEndsWithAscii(v) => ends_with(haystack, v, equals_ignore_ascii_case_kernel),
+            Predicate::Segments(v) => v.matches(haystack),
             Predicate::Regex(v) => v.is_match(haystack),
         }
     }
@@ -182,10 +188,62 @@ impl<'a> Predicate<'a> {
                     })
                 }
             }
+            Predicate::Segments(v) => {
+                BooleanArray::from_unary(array, |haystack| v.matches(haystack) != negate)
+            }
             Predicate::Regex(v) => {
                 BooleanArray::from_unary(array, |haystack| v.is_match(haystack) != negate)
             }
         }
+    }
+}
+
+/// A `LIKE` pattern made of literal segments separated by `%`, with no `_` and no escapes,
+/// such as `%special%requests%` or `foo%bar`.
+///
+/// It matches when the haystack starts with `prefix`, ends with `suffix`, and contains the
+/// `middle` segments in order, without overlapping, between them. Searching for each middle
+/// segment at its leftmost position is enough: it leaves the most room for the ones after it.
+/// This avoids building a regex for every call.
+pub(crate) struct Segments<'a> {
+    prefix: &'a [u8],
+    suffix: &'a [u8],
+    middle: Vec<Finder<'a>>,
+}
+
+impl<'a> Segments<'a> {
+    /// Returns `None` if `pattern` contains `_` or `\\`
+    fn new(pattern: &'a str) -> Option<Self> {
+        if memchr2(b'_', b'\\', pattern.as_bytes()).is_some() {
+            return None;
+        }
+        let mut parts = pattern.as_bytes().split(|b| *b == b'%');
+        let prefix = parts.next()?;
+        let suffix = parts.next_back()?;
+        let middle = parts.filter(|p| !p.is_empty()).map(Finder::new).collect();
+        Some(Self {
+            prefix,
+            suffix,
+            middle,
+        })
+    }
+
+    fn matches(&self, haystack: &str) -> bool {
+        let h = haystack.as_bytes();
+        if h.len() < self.prefix.len() + self.suffix.len()
+            || !h.starts_with(self.prefix)
+            || !h.ends_with(self.suffix)
+        {
+            return false;
+        }
+        let mut rest = &h[self.prefix.len()..h.len() - self.suffix.len()];
+        for finder in &self.middle {
+            match finder.find(rest) {
+                Some(i) => rest = &rest[i + finder.needle().len()..],
+                None => return false,
+            }
+        }
+        true
     }
 }
 
@@ -323,6 +381,64 @@ mod tests {
         for (like_pattern, expected_regexp) in test_cases {
             let r = regex_like(like_pattern, false).unwrap();
             assert_eq!(r.to_string(), expected_regexp);
+        }
+    }
+
+    #[test]
+    fn test_segments_match_regex() {
+        let patterns = [
+            "%special%requests%",
+            "a%b",
+            "a%a",
+            "%a%a%",
+            "a%%b",
+            "a%%b%%",
+            "ab%ba",
+            "%£%x%",
+            "x%y%z",
+            "%x%y",
+            "x%y%",
+        ];
+        let haystacks = [
+            "",
+            "a",
+            "aa",
+            "ab",
+            "aba",
+            "abba",
+            "aXb",
+            "ba",
+            "bab",
+            "xyz",
+            "x__y__z",
+            "xzy",
+            "zyx",
+            "x£y",
+            "£x",
+            "special requests",
+            "requests special",
+            "specialrequests and more",
+            "carefully special pinto requests",
+            "line\nbreak a\nb",
+        ];
+        for pattern in patterns {
+            let Predicate::Segments(segments) = Predicate::like(pattern).unwrap() else {
+                panic!("{pattern} should use Segments");
+            };
+            let regex = regex_like(pattern, false).unwrap();
+            for haystack in haystacks {
+                assert_eq!(
+                    segments.matches(haystack),
+                    regex.is_match(haystack),
+                    "{pattern} on {haystack:?}"
+                );
+            }
+        }
+        for pattern in ["a%b_c", r"a%b\%c", "%a%_"] {
+            assert!(matches!(
+                Predicate::like(pattern).unwrap(),
+                Predicate::Regex(_)
+            ));
         }
     }
 
