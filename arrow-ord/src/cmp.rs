@@ -303,7 +303,7 @@ fn compare_op(op: Op, lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, 
     let values = || -> BooleanBuffer {
         let d = downcast_primitive_array! {
             (l, r) => apply(op, l.values().as_ref(), &l_side, r.values().as_ref(), &r_side),
-            (Boolean, Boolean) => apply(op, l.as_boolean(), &l_side, r.as_boolean(), &r_side),
+            (Boolean, Boolean) => apply_boolean(op, l.as_boolean(), &l_side, r.as_boolean(), &r_side),
             (Utf8, Utf8) => apply(op, l.as_string::<i32>(), &l_side, r.as_string::<i32>(), &r_side),
             (Utf8View, Utf8View) => apply(op, l.as_string_view(), &l_side, r.as_string_view(), &r_side),
             (LargeUtf8, LargeUtf8) => apply(op, l.as_string::<i64>(), &l_side, r.as_string::<i64>(), &r_side),
@@ -433,6 +433,62 @@ fn eq_inline_scalar(
         let view = unsafe { *values.get_unchecked(idx) };
         view as u64 & significant == needle
     }))
+}
+
+/// Perform `op` on boolean values 64 at a time
+///
+/// Values behind a dictionary or run-end encoding, and scalar-to-scalar
+/// comparisons, use [`apply`].
+fn apply_boolean(
+    op: Op,
+    l: &BooleanArray,
+    l_info: &SideInfo,
+    r: &BooleanArray,
+    r_info: &SideInfo,
+) -> Option<BooleanBuffer> {
+    if l.is_empty()
+        || r.is_empty()
+        || l_info.has_indirection()
+        || r_info.has_indirection()
+        || (l_info.is_scalar && r_info.is_scalar)
+    {
+        return apply(op, l, l_info, r, r_info);
+    }
+
+    let word_op: fn(u64, u64) -> u64 = match op {
+        Op::Equal | Op::NotDistinct => |l, r| !(l ^ r),
+        Op::NotEqual | Op::Distinct => |l, r| l ^ r,
+        Op::Less => |l, r| !l & r,
+        Op::LessEqual => |l, r| !l | r,
+        Op::Greater => |l, r| l & !r,
+        Op::GreaterEqual => |l, r| l | !r,
+    };
+    // A scalar is a word with every bit set to its value
+    let splat = |scalar: &BooleanArray| if scalar.value(0) { u64::MAX } else { 0 };
+    let (l_v, r_v) = (l.values(), r.values());
+
+    Some(match (l_info.is_scalar, r_info.is_scalar) {
+        (true, _) => {
+            let l_word = splat(l);
+            BooleanBuffer::from_bitwise_unary_op(r_v.inner(), r_v.offset(), r_v.len(), |r| {
+                word_op(l_word, r)
+            })
+        }
+        (_, true) => {
+            let r_word = splat(r);
+            BooleanBuffer::from_bitwise_unary_op(l_v.inner(), l_v.offset(), l_v.len(), |l| {
+                word_op(l, r_word)
+            })
+        }
+        (false, false) => BooleanBuffer::from_bitwise_binary_op(
+            l_v.inner(),
+            l_v.offset(),
+            r_v.inner(),
+            r_v.offset(),
+            l_v.len(),
+            word_op,
+        ),
+    })
 }
 
 /// Perform a potentially vectored `op` on the provided `ArrayOrd`
@@ -1165,6 +1221,75 @@ mod tests {
 
         let r = neq(&a, &b).unwrap();
         assert!(!r.value(0))
+    }
+
+    #[test]
+    fn test_boolean() {
+        let reference = |op: Op, l: Option<bool>, r: Option<bool>| match op {
+            Op::Distinct => Some(l != r),
+            Op::NotDistinct => Some(l == r),
+            _ => l.zip(r).map(|(l, r)| match op {
+                Op::Equal => l == r,
+                Op::NotEqual => l != r,
+                Op::Less => !l & r,
+                Op::LessEqual => l <= r,
+                Op::Greater => l & !r,
+                Op::GreaterEqual => l >= r,
+                Op::Distinct | Op::NotDistinct => unreachable!(),
+            }),
+        };
+        let ops = [
+            Op::Equal,
+            Op::NotEqual,
+            Op::Less,
+            Op::LessEqual,
+            Op::Greater,
+            Op::GreaterEqual,
+            Op::Distinct,
+            Op::NotDistinct,
+        ];
+        let values = |seed: usize, nullable: bool| -> BooleanArray {
+            (0..200)
+                .map(|i| {
+                    let v = (i * 7 + seed) % 11;
+                    (!nullable || !v.is_multiple_of(5)).then_some(v.is_multiple_of(2))
+                })
+                .collect()
+        };
+
+        for (l_nullable, r_nullable) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let l = values(1, l_nullable);
+            let r = values(4, r_nullable);
+            // Slices that start and end inside a word, at different bit offsets
+            for (l_offset, r_offset, len) in [(0, 0, 200), (3, 3, 130), (5, 70, 64), (9, 1, 1)] {
+                let l = l.slice(l_offset, len);
+                let r = r.slice(r_offset, len);
+                for op in ops {
+                    let actual = compare_op(op, &l, &r).unwrap();
+                    let expected: BooleanArray = l
+                        .iter()
+                        .zip(r.iter())
+                        .map(|(l, r)| reference(op, l, r))
+                        .collect();
+                    assert_eq!(actual, expected, "{l_offset} {r_offset} {len} {op}");
+
+                    for scalar in [Some(true), Some(false), None] {
+                        let s = Scalar::new(BooleanArray::from(vec![scalar]));
+
+                        let actual = compare_op(op, &l, &s).unwrap();
+                        let expected: BooleanArray =
+                            l.iter().map(|l| reference(op, l, scalar)).collect();
+                        assert_eq!(actual, expected, "{l_offset} {len} {op} {scalar:?}");
+
+                        let actual = compare_op(op, &s, &r).unwrap();
+                        let expected: BooleanArray =
+                            r.iter().map(|r| reference(op, scalar, r)).collect();
+                        assert_eq!(actual, expected, "{scalar:?} {op} {r_offset} {len}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
