@@ -649,6 +649,30 @@ fn add_benchmark(c: &mut Criterion) {
     }
 
     group.finish();
+
+    let bool_a = create_boolean_array_with_seed(SIZE, 0.0, 0.5, 42);
+    let bool_b = create_boolean_array_with_seed(SIZE, 0.0, 0.5, 43);
+    let bool_nulls_a = create_boolean_array_with_seed(SIZE, 0.1, 0.5, 42);
+    let bool_nulls_b = create_boolean_array_with_seed(SIZE, 0.1, 0.5, 43);
+    let bool_scalar = BooleanArray::new_scalar(true);
+
+    c.bench_function("eq Boolean", |b| b.iter(|| eq(&bool_a, &bool_b)));
+    c.bench_function("eq scalar Boolean", |b| {
+        b.iter(|| eq(&bool_a, &bool_scalar).unwrap())
+    });
+    c.bench_function("lt Boolean", |b| b.iter(|| lt(&bool_a, &bool_b)));
+    c.bench_function("lt_eq scalar Boolean", |b| {
+        b.iter(|| lt_eq(&bool_a, &bool_scalar).unwrap())
+    });
+    c.bench_function("eq Boolean nulls", |b| {
+        b.iter(|| eq(&bool_nulls_a, &bool_nulls_b))
+    });
+    c.bench_function("distinct Boolean nulls", |b| {
+        b.iter(|| distinct(&bool_nulls_a, &bool_nulls_b))
+    });
+    c.bench_function("not_distinct scalar Boolean nulls", |b| {
+        b.iter(|| not_distinct(&bool_nulls_a, &bool_scalar).unwrap())
+    });
 }
 
 criterion_group!(benches, add_benchmark);
